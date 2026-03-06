@@ -40,7 +40,7 @@ ENV SKIP_ENV_VALIDATION=1
 ENV NODE_OPTIONS="--max-old-space-size=384"
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV SKIP_TYPE_CHECK=1
-RUN NODE_OPTIONS="--max-old-space-size=460" ./node_modules/.bin/next build --no-lint
+RUN NODE_OPTIONS="--max-old-space-size=460" ./node_modules/.bin/next build
 
 # ---------------------------------------------------------------------------
 # Stage 2: Production runtime (Python 3.12 + Node 22 + nginx + supervisord)
