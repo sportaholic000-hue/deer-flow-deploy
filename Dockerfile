@@ -1,6 +1,21 @@
 # =============================================================================
-# DeerFlow All-in-One Dockerfile for Render Deployment
+# DeerFlow All-in-One Dockerfile for Render Deployment (FIXED)
 # Combines: nginx + Next.js frontend + FastAPI gateway + LangGraph server
+#
+# FIXES applied vs original:
+#   1. Replaced heredocs in RUN with COPY of separate config files
+#      (heredocs inside RUN break the Dockerfile parser -- hadolint confirms
+#       "unexpected '[' at line 64" on the original)
+#   2. Removed --frozen-lockfile from pnpm install
+#   3. Fixed EXPOSE to use static port (env vars don't resolve in EXPOSE)
+#   4. Set SHELL to bash with pipefail for pipe-safety
+#   5. Added HEALTHCHECK for Render monitoring
+#   6. Changed default PORT to 10000 (Render's standard)
+#   7. Consolidated RUN layers where possible
+#
+# REQUIRED FILES in build context (same directory as this Dockerfile):
+#   - deerflow-supervisord.conf   (supervisord process config)
+#   - deerflow-nginx.template     (nginx reverse-proxy template)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -8,30 +23,36 @@
 # ---------------------------------------------------------------------------
 FROM node:22-alpine AS frontend-build
 
-RUN corepack enable && corepack install -g pnpm@10.26.2
-RUN apk add --no-cache git
+# hadolint ignore=DL3018
+RUN apk add --no-cache git \
+    && corepack enable && corepack install -g pnpm@10.26.2
 
 WORKDIR /app
 RUN git clone --depth 1 https://github.com/bytedance/deer-flow.git .
 
 WORKDIR /app/frontend
-RUN pnpm install --frozen-lockfile
-RUN pnpm build
+# Removed --frozen-lockfile: avoids lockfile version mismatch with pinned pnpm
+RUN pnpm install && pnpm build
 
 # ---------------------------------------------------------------------------
 # Stage 2: Production runtime (Python 3.12 + Node 22 + nginx + supervisord)
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim
 
-# Install Node.js 22, nginx, supervisord, and utilities
-RUN apt-get update && apt-get install -y \
+# Use bash with pipefail for all RUN commands (fixes DL4006)
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Install system deps in a single layer for cache efficiency
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    bash \
     nginx \
     supervisor \
     git \
     gettext-base \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
+    && apt-get install -y --no-install-recommends nodejs \
     && corepack enable && corepack install -g pnpm@10.26.2 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -52,110 +73,33 @@ WORKDIR /app/backend
 RUN uv sync
 WORKDIR /app
 
+# ---------------------------------------------------------------------------
+# Config files -- COPY instead of fragile heredocs in RUN
+# ---------------------------------------------------------------------------
+
+# supervisord config -- runs all 4 processes
+COPY deerflow-supervisord.conf /etc/supervisor/conf.d/deerflow.conf
+
+# nginx config template -- $PORT is substituted at runtime via envsubst
+COPY deerflow-nginx.template /etc/nginx/conf.d/deerflow.template
+
+# Remove default nginx site and create log dirs
+RUN rm -f /etc/nginx/sites-enabled/default \
+    && mkdir -p /var/log/supervisor
+
 # Environment variables (Render env vars override these at runtime)
 ENV GROQ_API_KEY=""
 ENV TAVILY_API_KEY=""
 ENV SEARCH_API="tavily"
 
-# ---------------------------------------------------------------------------
-# supervisord config -- runs all 4 processes
-# ---------------------------------------------------------------------------
-RUN cat > /etc/supervisor/conf.d/deerflow.conf << 'SUPERVISORD'
-[supervisord]
-nodaemon=true
-logfile=/var/log/supervisor/supervisord.log
+# Default port (Render overrides via $PORT env var; 10000 is Render's standard)
+ENV PORT=10000
 
-[program:langgraph]
-command=bash -c "cd /app/backend && uv run langgraph dev --host 0.0.0.0 --port 2024 --no-browser --config /app/backend/langgraph.json"
-autorestart=true
-stdout_logfile=/var/log/langgraph.log
-stderr_logfile=/var/log/langgraph_err.log
-startsecs=3
+# Static EXPOSE (env vars don't resolve in EXPOSE instruction)
+EXPOSE 10000
 
-[program:gateway]
-command=bash -c "cd /app/backend && uv run uvicorn src.gateway.app:app --host 0.0.0.0 --port 8001"
-autorestart=true
-stdout_logfile=/var/log/gateway.log
-stderr_logfile=/var/log/gateway_err.log
-startretries=5
-startsecs=5
-
-[program:frontend]
-command=bash -c "cd /app/frontend && npx next start -p 3000"
-autorestart=true
-stdout_logfile=/var/log/frontend.log
-stderr_logfile=/var/log/frontend_err.log
-
-[program:nginx]
-command=bash -c "envsubst '$$PORT' < /etc/nginx/conf.d/deerflow.template > /etc/nginx/conf.d/deerflow.conf && nginx -g 'daemon off;'"
-autorestart=true
-stdout_logfile=/var/log/nginx_out.log
-stderr_logfile=/var/log/nginx_err.log
-SUPERVISORD
-
-# ---------------------------------------------------------------------------
-# nginx config template -- uses $PORT from Render at runtime
-# ---------------------------------------------------------------------------
-RUN mkdir -p /etc/nginx/conf.d && cat > /etc/nginx/conf.d/deerflow.template << 'NGINX'
-server {
-    listen ${PORT};
-
-    client_max_body_size 100M;
-    proxy_read_timeout 300s;
-    proxy_send_timeout 300s;
-
-    # LangGraph server (SSE streaming)
-    location /api/langgraph/ {
-        rewrite ^/api/langgraph/(.*) /$1 break;
-        proxy_pass http://127.0.0.1:2024;
-        proxy_http_version 1.1;
-        proxy_set_header Connection '';
-        proxy_set_header Host $host;
-        proxy_buffering off;
-        proxy_cache off;
-        chunked_transfer_encoding off;
-    }
-
-    # FastAPI gateway
-    location /api/ {
-        proxy_pass http://127.0.0.1:8001;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-
-    # Gateway health / docs endpoints
-    location /health {
-        proxy_pass http://127.0.0.1:8001;
-    }
-
-    location /docs {
-        proxy_pass http://127.0.0.1:8001;
-    }
-
-    location /openapi.json {
-        proxy_pass http://127.0.0.1:8001;
-    }
-
-    # Next.js frontend (catch-all, WebSocket support)
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-    }
-}
-NGINX
-
-# Remove default nginx site so it doesn't conflict
-RUN rm -f /etc/nginx/sites-enabled/default
-
-# Create log directories
-RUN mkdir -p /var/log/supervisor
-
-# Default port (Render overrides via $PORT env var)
-ENV PORT=2026
-
-EXPOSE ${PORT}
+# Health check -- verify nginx is responding
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
