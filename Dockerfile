@@ -37,8 +37,8 @@ RUN pnpm install
 # Without this, build fails: "Invalid environment variables: { BETTER_AUTH_SECRET: [ Required ] }"
 ENV SKIP_ENV_VALIDATION=1
 # Limit memory to avoid OOM on constrained build environments
-ENV NODE_OPTIONS="--max-old-space-size=768"
-RUN NODE_OPTIONS="--max-old-space-size=768" NEXT_DISABLE_ESLINT=1 pnpm build
+ENV NODE_OPTIONS="--max-old-space-size=384"
+RUN pnpm build
 
 # ---------------------------------------------------------------------------
 # Stage 2: Production runtime (Python 3.12 + Node 22 + nginx + supervisord)
@@ -96,8 +96,30 @@ RUN rm -f /etc/nginx/sites-enabled/default \
 # Entrypoint script: generates .env from Render environment variables
 # before starting supervisord
 # ---------------------------------------------------------------------------
-RUN printf '#!/bin/bash\nset -e\n\n# Generate .env for backend from Render env vars\ncat > /app/backend/.env << EOF\nGROQ_API_KEY=${GROQ_API_KEY:-}\nTAVILY_API_KEY=${TAVILY_API_KEY:-}\nSEARCH_API=${SEARCH_API:-tavily}\nEOF\n\n# Also create root .env (some imports look here)\ncp /app/backend/.env /app/.env\n\necho "=== DeerFlow starting ==="\necho "PORT=${PORT:-10000}"\necho "SEARCH_API=${SEARCH_API:-tavily}"\necho "=== Launching supervisord ==="\n\nexec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf\n' > /app/entrypoint.sh \
-    && chmod +x /app/entrypoint.sh
+RUN cat > /app/entrypoint.sh << 'ENTRYPOINT'
+#!/bin/bash
+set -e
+
+export PORT="${PORT:-10000}"
+
+echo "=== DeerFlow starting on PORT=$PORT ==="
+
+# Generate .env for backend from Render env vars
+cat > /app/backend/.env << EOF
+GROQ_API_KEY=${GROQ_API_KEY:-}
+TAVILY_API_KEY=${TAVILY_API_KEY:-}
+SEARCH_API=${SEARCH_API:-tavily}
+EOF
+
+cp /app/backend/.env /app/.env
+
+# Pre-generate nginx config so it's ready before nginx starts
+envsubst '$PORT' < /etc/nginx/conf.d/deerflow.template > /etc/nginx/conf.d/deerflow.conf
+
+echo "=== Launching supervisord ==="
+exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+ENTRYPOINT
+RUN chmod +x /app/entrypoint.sh
 
 # Environment variables (Render env vars override at runtime)
 ENV GROQ_API_KEY=""
