@@ -37,8 +37,8 @@ RUN pnpm install
 # Without this, build fails: "Invalid environment variables: { BETTER_AUTH_SECRET: [ Required ] }"
 ENV SKIP_ENV_VALIDATION=1
 # Limit memory to avoid OOM on constrained build environments
-ENV NODE_OPTIONS="--max-old-space-size=384"
-RUN pnpm build
+ENV NODE_OPTIONS="--max-old-space-size=768"
+RUN NODE_OPTIONS="--max-old-space-size=768" pnpm build --no-lint
 
 # ---------------------------------------------------------------------------
 # Stage 2: Production runtime (Python 3.12 + Node 22 + nginx + supervisord)
