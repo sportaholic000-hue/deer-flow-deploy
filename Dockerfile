@@ -38,7 +38,9 @@ RUN pnpm install
 ENV SKIP_ENV_VALIDATION=1
 # Limit memory to avoid OOM on constrained build environments
 ENV NODE_OPTIONS="--max-old-space-size=384"
-RUN pnpm build
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV SKIP_TYPE_CHECK=1
+RUN node --max-old-space-size=460 ./node_modules/.bin/next build --no-lint
 
 # ---------------------------------------------------------------------------
 # Stage 2: Production runtime (Python 3.12 + Node 22 + nginx + supervisord)
