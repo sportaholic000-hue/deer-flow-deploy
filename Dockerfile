@@ -1,19 +1,15 @@
 # =============================================================================
-# DeerFlow All-in-One Dockerfile for Render Deployment (FIXED)
-# Combines: nginx + Next.js frontend + FastAPI gateway + LangGraph server
+# DeerFlow All-in-One Dockerfile for Render Deployment (v2 - FULLY FIXED)
 #
-# FIXES applied vs original:
-#   1. Replaced heredocs in RUN with COPY of separate config files
-#      (heredocs inside RUN break the Dockerfile parser -- hadolint confirms
-#       "unexpected '[' at line 64" on the original)
-#   2. Removed --frozen-lockfile from pnpm install
-#   3. Fixed EXPOSE to use static port (env vars don't resolve in EXPOSE)
-#   4. Set SHELL to bash with pipefail for pipe-safety
-#   5. Added HEALTHCHECK for Render monitoring
-#   6. Changed default PORT to 10000 (Render's standard)
-#   7. Consolidated RUN layers where possible
+# FIXES vs v1:
+#   1. Added SKIP_ENV_VALIDATION=1 -- CRITICAL: frontend env.js requires
+#      BETTER_AUTH_SECRET in production mode, which isn't available at build time
+#   2. Split pnpm install / pnpm build into separate RUN layers for caching
+#   3. Added config.yaml generation from config.example.yaml
+#   4. Added entrypoint script that generates .env from Render env vars
+#   5. Added NODE_OPTIONS=--max-old-space-size=384 to prevent OOM on free tier
 #
-# REQUIRED FILES in build context (same directory as this Dockerfile):
+# REQUIRED FILES in build context:
 #   - deerflow-supervisord.conf   (supervisord process config)
 #   - deerflow-nginx.template     (nginx reverse-proxy template)
 # =============================================================================
@@ -31,18 +27,28 @@ WORKDIR /app
 RUN git clone --depth 1 https://github.com/bytedance/deer-flow.git .
 
 WORKDIR /app/frontend
-# Removed --frozen-lockfile: avoids lockfile version mismatch with pinned pnpm
-RUN pnpm install && pnpm build
+
+# Separate install from build for better layer caching
+RUN pnpm install
+
+# CRITICAL FIX: Skip env validation during build.
+# frontend/src/env.js uses @t3-oss/env-nextjs which requires BETTER_AUTH_SECRET
+# in production mode (NODE_ENV=production, set automatically by 'next build').
+# Without this, build fails: "Invalid environment variables: { BETTER_AUTH_SECRET: [ Required ] }"
+ENV SKIP_ENV_VALIDATION=1
+# Limit memory to avoid OOM on constrained build environments
+ENV NODE_OPTIONS="--max-old-space-size=384"
+RUN pnpm build
 
 # ---------------------------------------------------------------------------
 # Stage 2: Production runtime (Python 3.12 + Node 22 + nginx + supervisord)
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim
 
-# Use bash with pipefail for all RUN commands (fixes DL4006)
+# Use bash with pipefail for all RUN commands
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Install system deps in a single layer for cache efficiency
+# Install system deps in a single layer
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -60,7 +66,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
-# Clone the DeerFlow repo
+# Clone the DeerFlow repo (needed for backend + config files)
 WORKDIR /app
 RUN git clone --depth 1 https://github.com/bytedance/deer-flow.git .
 
@@ -73,33 +79,39 @@ WORKDIR /app/backend
 RUN uv sync
 WORKDIR /app
 
-# ---------------------------------------------------------------------------
-# Config files -- COPY instead of fragile heredocs in RUN
-# ---------------------------------------------------------------------------
+# FIX: Create config.yaml from example (runtime env vars override via entrypoint)
+RUN cp config.example.yaml config.yaml
 
-# supervisord config -- runs all 4 processes
+# ---------------------------------------------------------------------------
+# Config files -- COPY instead of fragile heredocs
+# ---------------------------------------------------------------------------
 COPY deerflow-supervisord.conf /etc/supervisor/conf.d/deerflow.conf
-
-# nginx config template -- $PORT is substituted at runtime via envsubst
 COPY deerflow-nginx.template /etc/nginx/conf.d/deerflow.template
 
 # Remove default nginx site and create log dirs
 RUN rm -f /etc/nginx/sites-enabled/default \
     && mkdir -p /var/log/supervisor
 
-# Environment variables (Render env vars override these at runtime)
+# ---------------------------------------------------------------------------
+# Entrypoint script: generates .env from Render environment variables
+# before starting supervisord
+# ---------------------------------------------------------------------------
+RUN printf '#!/bin/bash\nset -e\n\n# Generate .env for backend from Render env vars\ncat > /app/backend/.env << EOF\nGROQ_API_KEY=${GROQ_API_KEY:-}\nTAVILY_API_KEY=${TAVILY_API_KEY:-}\nSEARCH_API=${SEARCH_API:-tavily}\nEOF\n\n# Also create root .env (some imports look here)\ncp /app/backend/.env /app/.env\n\necho "=== DeerFlow starting ==="\necho "PORT=${PORT:-10000}"\necho "SEARCH_API=${SEARCH_API:-tavily}"\necho "=== Launching supervisord ==="\n\nexec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf\n' > /app/entrypoint.sh \
+    && chmod +x /app/entrypoint.sh
+
+# Environment variables (Render env vars override at runtime)
 ENV GROQ_API_KEY=""
 ENV TAVILY_API_KEY=""
 ENV SEARCH_API="tavily"
-
-# Default port (Render overrides via $PORT env var; 10000 is Render's standard)
 ENV PORT=10000
+ENV SKIP_ENV_VALIDATION=1
 
-# Static EXPOSE (env vars don't resolve in EXPOSE instruction)
+# Static EXPOSE
 EXPOSE 10000
 
-# Health check -- verify nginx is responding
+# Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
+# Use entrypoint script instead of direct supervisord
+CMD ["/app/entrypoint.sh"]
