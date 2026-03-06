@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y \
     nginx \
     supervisor \
     git \
-    getenv-base \
+    gettext-base \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && corepack enable && corepack install -g pnpm@10.26.2 \
@@ -58,7 +58,7 @@ ENV TAVILY_API_KEY=""
 ENV SEARCH_API="tavily"
 
 # ---------------------------------------------------------------------------
-# supervisord config — runs all 4 processes
+# supervisord config -- runs all 4 processes
 # ---------------------------------------------------------------------------
 RUN cat > /etc/supervisor/conf.d/deerflow.conf << 'SUPERVISORD'
 [supervisord]
@@ -94,7 +94,7 @@ stderr_logfile=/var/log/nginx_err.log
 SUPERVISORD
 
 # ---------------------------------------------------------------------------
-# nginx config template — uses $PORT from Render at runtime
+# nginx config template -- uses $PORT from Render at runtime
 # ---------------------------------------------------------------------------
 RUN mkdir -p /etc/nginx/conf.d && cat > /etc/nginx/conf.d/deerflow.template << 'NGINX'
 server {
