@@ -1,0 +1,48 @@
+server {
+    listen ${PORT};
+
+    client_max_body_size 100M;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+
+    # LangGraph server (SSE streaming)
+    location /api/langgraph/ {
+        rewrite ^/api/langgraph/(.*) /$1 break;
+        proxy_pass http://127.0.0.1:2024;
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+        proxy_set_header Host $host;
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding off;
+    }
+
+    # FastAPI gateway
+    location /api/ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # Gateway health / docs endpoints
+    location /health {
+        proxy_pass http://127.0.0.1:8001;
+    }
+
+    location /docs {
+        proxy_pass http://127.0.0.1:8001;
+    }
+
+    location /openapi.json {
+        proxy_pass http://127.0.0.1:8001;
+    }
+
+    # Next.js frontend (catch-all, WebSocket support)
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }
+}
